@@ -1,0 +1,341 @@
+# Jenkinsfile - Detailed Comments Version
+# This file defines the CI/CD pipeline for AWS Terraform infrastructure
+
+@Library('shared-pipeline-library') _
+
+pipeline {
+    agent {
+        label 'linux'  # or 'windows' for Windows agents
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'uat', 'prod'],
+            description: 'Target environment for deployment'
+        )
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Terraform action: plan (preview changes), apply (deploy), destroy (remove resources)'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Automatically approve apply (only for dev, NOT for prod)'
+        )
+    }
+
+    environment {
+        // AWS Configuration
+        AWS_REGION = 'us-east-1'
+        AWS_CREDENTIALS = credentials('aws-service-account')
+        
+        // GitHub Configuration  
+        GITHUB_CREDENTIALS = credentials('github-credentials')
+        GIT_REPO = 'https://github.com/YOUR_ORG/aws_terraform_vpn.git'
+        
+        // Terraform Configuration
+        TERRAFORM_VERSION = '1.6.0'
+        TF_VAR_FILE = "resources/${ENVIRONMENT}/terraform.tfvars"
+        TF_BACKEND_BUCKET = "${ENVIRONMENT}-terraform-state"
+        LOCK_TABLE = "terraform-locks-${ENVIRONMENT}"
+    }
+
+    options {
+        // Preserve console colors
+        ansiColor('xterm')
+        // Add timestamps to log output
+        timestamps()
+        // Timeout after 1 hour
+        timeout(time: 1, unit: 'HOURS')
+        // Keep last 30 builds
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '🔍 Stage: Checkout Repository'
+                    echo '═══════════════════════════════════════'
+                }
+                // Clone the repository
+                checkout scm
+                sh '''
+                    echo "Git branch: $(git rev-parse --abbrev-ref HEAD)"
+                    echo "Git commit: $(git rev-parse --short HEAD)"
+                    echo "Git author: $(git log -1 --pretty=format:'%an')"
+                '''
+            }
+        }
+
+        stage('Validate Environment') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '✅ Stage: Validate Environment'
+                    echo '═══════════════════════════════════════'
+                    
+                    // Prevent auto-approval on production
+                    if (ENVIRONMENT == 'prod' && AUTO_APPROVE) {
+                        error("❌ AUTO_APPROVE cannot be true for PROD environment!")
+                    }
+                }
+                sh '''
+                    echo "Environment: ${ENVIRONMENT}"
+                    echo "Action: ${ACTION}"
+                    echo "Terraform vars file: ${TF_VAR_FILE}"
+                    
+                    # Check if variables file exists
+                    if [ ! -f "${TF_VAR_FILE}" ]; then
+                        echo "❌ Terraform variables file not found: ${TF_VAR_FILE}"
+                        exit 1
+                    fi
+                    echo "✅ Terraform variables file found"
+                '''
+            }
+        }
+
+        stage('Setup Terraform') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '🛠️ Stage: Setup Terraform'
+                    echo '═══════════════════════════════════════'
+                }
+                sh '''
+                    # Show Terraform version
+                    terraform -v
+                    
+                    echo "✅ Terraform setup completed"
+                '''
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '📦 Stage: Terraform Init'
+                    echo '═══════════════════════════════════════'
+                }
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-service-account', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        export AWS_REGION=${AWS_REGION}
+                        
+                        # Initialize Terraform with upgrade flag
+                        terraform init \
+                            -var-file="${TF_VAR_FILE}" \
+                            -upgrade \
+                            -lock=true
+                        
+                        echo "✅ Terraform init completed"
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Format Check') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '🎯 Stage: Format Check'
+                    echo '═══════════════════════════════════════'
+                }
+                sh '''
+                    # Check if Terraform code is properly formatted
+                    terraform fmt -check -recursive . || true
+                    echo "✅ Format check completed"
+                '''
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '🔐 Stage: Validate Configuration'
+                    echo '═══════════════════════════════════════'
+                }
+                sh '''
+                    # Validate Terraform configuration syntax
+                    terraform validate
+                    echo "✅ Configuration validation completed"
+                '''
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '📋 Stage: Terraform Plan'
+                    echo '═══════════════════════════════════════'
+                }
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-service-account', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        export AWS_REGION=${AWS_REGION}
+                        
+                        # Generate Terraform plan
+                        terraform plan \
+                            -var-file="${TF_VAR_FILE}" \
+                            -out=tfplan-${ENVIRONMENT}.tfplan \
+                            -lock=true
+                        
+                        # Export plan in human-readable format
+                        terraform show -no-color tfplan-${ENVIRONMENT}.tfplan > tfplan-${ENVIRONMENT}.txt || true
+                        
+                        echo "✅ Terraform plan completed"
+                    '''
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                expression { 
+                    return params.ACTION == 'apply'
+                }
+            }
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '⏸️  Stage: Approval'
+                    echo '═══════════════════════════════════════'
+                    
+                    if (ENVIRONMENT == 'prod' && !AUTO_APPROVE) {
+                        input message: "⚠️  Deploy to PROD environment? This cannot be undone!", ok: 'Deploy to PROD'
+                    } else if (AUTO_APPROVE) {
+                        echo "✅ Auto-approval enabled"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                expression {
+                    return params.ACTION == 'apply'
+                }
+            }
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '🚀 Stage: Terraform Apply'
+                    echo '═══════════════════════════════════════'
+                }
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-service-account', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        export AWS_REGION=${AWS_REGION}
+                        
+                        # Apply Terraform plan
+                        terraform apply \
+                            -lock=true \
+                            -input=false \
+                            tfplan-${ENVIRONMENT}.tfplan
+                        
+                        echo "✅ Terraform apply completed"
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+            when {
+                expression {
+                    return params.ACTION == 'destroy'
+                }
+            }
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '🗑️  Stage: Terraform Destroy'
+                    echo '═══════════════════════════════════════'
+                    
+                    if (ENVIRONMENT == 'prod') {
+                        input message: "⚠️⚠️⚠️ DESTROYING PROD! Cannot undo this action!", ok: 'Destroy PROD'
+                    }
+                }
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-service-account', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        export AWS_REGION=${AWS_REGION}
+                        
+                        # Destroy Terraform resources
+                        terraform destroy \
+                            -var-file="${TF_VAR_FILE}" \
+                            -lock=true \
+                            -auto-approve
+                        
+                        echo "✅ Terraform destroy completed"
+                    '''
+                }
+            }
+        }
+
+        stage('Export Outputs') {
+            when {
+                expression {
+                    return params.ACTION == 'apply'
+                }
+            }
+            steps {
+                script {
+                    echo '═══════════════════════════════════════'
+                    echo '📤 Stage: Export Outputs'
+                    echo '═══════════════════════════════════════'
+                }
+                sh '''
+                    # Export outputs as JSON
+                    terraform output -json > outputs-${ENVIRONMENT}.json
+                    terraform output
+                    echo "✅ Outputs exported"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo '═══════════════════════════════════════'
+                echo '📊 Post-Build Actions'
+                echo '═══════════════════════════════════════'
+            }
+            
+            // Archive Terraform plans and outputs
+            archiveArtifacts artifacts: 'tfplan-*.txt,outputs-*.json', allowEmptyArchive: true
+            
+            // Clean workspace to remove sensitive data
+            cleanWs(
+                deleteDirs: true,
+                patterns: [
+                    [pattern: '.terraform', type: 'INCLUDE'],
+                    [pattern: '.tfplan', type: 'INCLUDE'],
+                    [pattern: 'terraform.tfstate*', type: 'INCLUDE']
+                ]
+            )
+        }
+
+        success {
+            script {
+                echo '✅ Pipeline completed successfully'
+            }
+        }
+
+        failure {
+            script {
+                echo '❌ Pipeline failed - check logs above'
+            }
+        }
+    }
+}
